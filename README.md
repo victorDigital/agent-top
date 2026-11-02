@@ -1,3 +1,5 @@
+![agent-top's card view on a MacBook Pro: each agent's activity, current tool, workflows and subagent tiles](docs/screenshots/agent-top-cards-mac.png)
+
 # <img src="https://raw.githubusercontent.com/kannandreams/agent-top/main/docs/assets/favicon.svg" width="32" alt="" align="top"> agent-top
 
 **htop for local coding agents.**
