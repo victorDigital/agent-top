@@ -1,7 +1,7 @@
-//! Rendering. Layout, top to bottom: header (host gauges + totals), agent
-//! table, optional detail pane (process tree + token breakdown), key bar.
+//! Rendering. Layout, top to bottom: header (host gauges + totals), agent cards
+//! or the agent table with its detail pane (process tree + token breakdown), key bar.
 
-use crate::app::{App, DetailView, Overlay, Panel};
+use crate::app::{App, DetailView, Overlay, Panel, View};
 use crate::format::{
     age, bytes, cost, cpu_cell, duration_ms, mem_cell, nested_name, session_name, short_cmd, short_model, tokens, tokens_cell, tool_calls,
     truncate,
@@ -135,6 +135,14 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         let [header, body, footer] = Layout::vertical([Constraint::Length(6), Constraint::Min(4), Constraint::Length(1)]).areas(area);
         draw_header(f, app, header, theme);
         draw_pinned(f, body, app, p, theme);
+        draw_footer(f, app, footer, theme);
+        draw_overlay(f, area, app, theme);
+        return;
+    }
+    if app.view == View::Cards {
+        let [header, body, footer] = Layout::vertical([Constraint::Length(6), Constraint::Min(4), Constraint::Length(1)]).areas(area);
+        draw_header(f, app, header, theme);
+        crate::cards::draw_cards(f, app, body, theme);
         draw_footer(f, app, footer, theme);
         draw_overlay(f, area, app, theme);
         return;
@@ -464,7 +472,7 @@ enum ToolPanel {
 fn tool_stats(snap: &agent_top_core::Snapshot) -> Vec<ToolStat> {
     use std::collections::HashMap;
     let mut by: HashMap<&str, ToolStat> = HashMap::new();
-    for a in &snap.agents {
+    for a in snap.agents.iter().filter(|a| !a.counted_in_parent) {
         for sp in &a.spans {
             if sp.kind != SpanKind::Tool {
                 continue;
@@ -590,9 +598,21 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         )),
         mem_row,
     );
-    let [spark_label, spark] = Layout::horizontal([Constraint::Length(11), Constraint::Min(4)]).areas(spark_row);
-    f.render_widget(Paragraph::new(Span::styled("out tok/s ", Style::default().fg(theme.dim))), spark_label);
+    let rate = app.output_rate.last().copied().unwrap_or(0);
+    let peak = format!(" peak {}", tokens(app.output_rate.iter().copied().max().unwrap_or(0)));
+    let [spark_label, spark, spark_peak] =
+        Layout::horizontal([Constraint::Length(22), Constraint::Min(4), Constraint::Length(peak.chars().count() as u16 + 3)])
+            .areas(spark_row);
+    let rate_style = if rate > 0 { Style::default().fg(theme.accent).bold() } else { Style::default().fg(theme.text).bold() };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("out tok/s", Style::default().fg(theme.dim)),
+            Span::styled(format!("{:>12}", tokens(rate)), rate_style),
+        ])),
+        spark_label,
+    );
     f.render_widget(Sparkline::default().data(&app.output_rate).style(Style::default().fg(theme.accent)), spark);
+    f.render_widget(Paragraph::new(Span::styled(peak, Style::default().fg(theme.dim))), spark_peak);
 
     let t = &snap.totals;
     let lines = vec![
@@ -661,12 +681,30 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     )
     .bottom_margin(0);
 
+    let widths = [
+        Constraint::Min(14),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(14),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(7),
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(4),
+        Constraint::Length(7),
+    ];
+    let fixed: u16 = widths.iter().map(|c| if let Constraint::Length(n) = c { *n } else { 0 }).sum();
+    // Borders, the highlight symbol and one space between each column.
+    let name_width = usize::from(area.width.saturating_sub(fixed + 2 + 2 + widths.len() as u16 - 1)).max(26);
     let rows = app.rows.iter().enumerate().map(|(i, a)| {
         let mem = mem_cell(a);
         let cpu = cpu_cell(a);
         let mcp_style = if a.mcp_count > 0 { Style::default().fg(theme.mauve) } else { Style::default() };
         Row::new(vec![
-            Cell::from(table_session_name(a, app.row_depths[i])).style(Style::default().bold()),
+            Cell::from(table_session_name(a, app.row_depths[i], name_width)).style(Style::default().bold()),
             Cell::from(a.harness.label()),
             Cell::from(a.state.label()).style(state_style(a.state, theme)),
             Cell::from(a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
@@ -689,21 +727,6 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         .style(if a.state == AgentState::Stopped { Style::default().fg(theme.dim) } else { Style::default() })
     });
 
-    let widths = [
-        Constraint::Min(14),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(7),
-        Constraint::Length(14),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(6),
-        Constraint::Length(7),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(4),
-        Constraint::Length(7),
-    ];
     let title = format!("agents ({})", app.rows.len());
     let table = Table::new(rows, widths)
         .header(header)
@@ -750,8 +773,8 @@ fn kv<'a>(k: &'a str, v: String, theme: &Theme) -> Line<'a> {
     Line::from(vec![Span::styled(format!("{k:<11}"), Style::default().fg(theme.dim)), Span::raw(v)])
 }
 
-fn table_session_name(a: &Agent, depth: usize) -> String {
-    nested_name(a, depth, 26)
+fn table_session_name(a: &Agent, depth: usize, width: usize) -> String {
+    nested_name(a, depth, width)
 }
 
 /// One line of the cost breakdown: tokens, the price they were charged at,
@@ -980,7 +1003,9 @@ fn agent_facts(a: &Agent, now: SystemTime, theme: &Theme) -> Text<'static> {
     if let Some(p) = &a.session_path {
         lines.push(kv("transcript", tilde(p), theme));
     }
-    if let Some(id) = &a.session_id {
+    if let Some(id) = &a.session_id
+        && !a.counted_in_parent
+    {
         // How much of the id `agent-top trace` needs is a property of the
         // harness's id format, which `Harness::session_id_prefix_len` holds.
         let short: String = match a.harness.session_id_prefix_len() {
@@ -1171,7 +1196,13 @@ fn tree_detail(app: &App, selected: &Agent, width: usize, theme: &Theme) -> Text
         .unwrap_or(selected);
     let shared = selected.shares_process
         || (selected.pid.is_some()
-            && app.snapshot.agents.iter().filter(|a| a.pid == selected.pid && a.harness == selected.harness).count() > 1);
+            && app
+                .snapshot
+                .agents
+                .iter()
+                .filter(|a| a.pid == selected.pid && a.harness == selected.harness && !a.counted_in_parent)
+                .count()
+                > 1);
     if shared {
         lines.push(Line::styled("CPU/RSS shared by sessions", Style::default().fg(theme.dim)));
     }
@@ -1395,8 +1426,27 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         panel_keys(&mut left);
         left.push(sep());
         left.extend(key("?", "help", theme.accent));
+    } else if app.view == View::Cards {
+        left.extend(key("↑↓/jk", "select", theme.accent));
+        left.extend(key("Enter", "details", theme.accent));
+        left.extend(key("s", format!("sort:{}{}", app.sort.label(), if app.sort_desc { "↑" } else { "↓" }).as_str(), theme.accent));
+        left.extend(key("r", "reverse", theme.accent));
+        let hidden = app.hidden_cards();
+        if app.show_stopped {
+            left.extend(key("x", "hide inactive", theme.accent));
+        } else if hidden > 0 {
+            left.extend(key("x", &format!("show {hidden} hidden"), theme.accent));
+        }
+        left.extend(key("p", if app.paused { "resume" } else { "pause" }, theme.accent));
+        left.push(sep());
+        panel_keys(&mut left);
+        left.push(sep());
+        left.extend(key("?", "help", theme.accent));
     } else {
         // Navigation and view.
+        if app.home == View::Cards {
+            left.extend(key("Esc", "cards", theme.accent));
+        }
         left.extend(key("↑↓/jk", "select", theme.accent));
         left.extend(key("s", format!("sort:{}{}", app.sort.label(), if app.sort_desc { "↑" } else { "↓" }).as_str(), theme.accent));
         left.extend(key("r", "reverse", theme.accent));
@@ -1434,6 +1484,7 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let lines = vec![
         Line::from(vec![Span::styled("keys", Style::default().fg(theme.accent).bold())]),
         Line::raw("  ↑ ↓ j k      move selection      g G     first / last"),
+        Line::raw("  Enter        cards: open the table and detail pane; Esc back"),
         Line::raw("  s            cycle sort column   r       reverse sort"),
         Line::raw("  t / Enter    toggle detail pane  x       toggle stopped rows"),
         Line::raw("  Tab / v      detail: tree ⇄ trace"),
@@ -1454,6 +1505,13 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
             Span::styled("mcp servers", Style::default().fg(theme.mauve)),
             Span::raw(": every server under every agent, and the orphans"),
         ]),
+        Line::raw(""),
+        Line::from(vec![Span::styled("cards", Style::default().fg(theme.accent).bold())]),
+        Line::raw("  One per agent; subagents and workflows ride inside their parent's."),
+        Line::raw("  The bar is the last 10 minutes: taller = busier, warmer = more"),
+        Line::raw("  agents working at once, red = a call failed. New cards glow for a"),
+        Line::raw("  few seconds; a finished agent's card fades out, and one quiet for"),
+        Line::raw("  15 minutes hides unless a subagent is busy. x shows them all."),
         Line::raw(""),
         Line::from(vec![Span::styled("panels", Style::default().fg(theme.accent).bold())]),
         Line::raw("  Each of l f a m is a popup over the table. On the popup:"),
@@ -1572,6 +1630,7 @@ mod tests {
             parse_warning: None,
             rate_limit: None,
             harness_cost: None,
+            counted_in_parent: false,
         }
     }
 
@@ -1653,8 +1712,8 @@ mod tests {
         app.selected_id = Some("session-scout".into());
         app.rebuild_rows();
         assert_eq!(app.row_depths, vec![0, 1, 2]);
-        assert_eq!(table_session_name(&app.rows[1], 1), "↳ Scout (explorer)");
-        assert_eq!(table_session_name(&app.rows[2], 2), "  ↳ Review (reviewer)");
+        assert_eq!(table_session_name(&app.rows[1], 1, 26), "↳ Scout (explorer)");
+        assert_eq!(table_session_name(&app.rows[2], 2, 26), "  ↳ Review (reviewer)");
         let selected = app.selected_agent().unwrap();
         assert_eq!(mem_cell(selected), "·");
         assert_eq!(cpu_cell(selected), "·");
@@ -1779,7 +1838,7 @@ mod tests {
         app.rebuild_rows();
         assert_eq!(app.rows.len(), 2);
         let selected = app.selected_agent().unwrap();
-        assert!(table_session_name(selected, 0).starts_with("[subagent]"));
+        assert!(table_session_name(selected, 0, 26).starts_with("[subagent]"));
         let theme = Theme::new(ThemeMode::Dark, true);
         let text = tree_detail(&app, selected, 120, &theme).to_string();
         assert!(text.contains("rss 256M"), "the hidden resource-owner row remains inspectable: {text}");
@@ -1825,7 +1884,7 @@ mod tests {
     fn no_lineage_keeps_the_existing_process_view() {
         let app = App::new(snapshot(vec![agent("standalone", Vec::new())]));
         let selected = app.selected_agent().unwrap();
-        assert_eq!(table_session_name(selected, 0), "standalone");
+        assert_eq!(table_session_name(selected, 0, 26), "standalone");
         let text = tree_detail(&app, selected, 120, &Theme::new(ThemeMode::Dark, true)).to_string();
         assert!(text.starts_with("process tree"));
         assert!(!text.contains("session tree"));
@@ -1849,6 +1908,7 @@ mod tests {
             orphan_origins: Vec::new(),
             advice: Vec::new(),
             totals: Totals::default(),
+            catching_up: false,
         };
         s.compute_totals();
         s
@@ -1928,6 +1988,75 @@ mod tests {
                 assert!(buf.content.iter().all(|cell| cell.fg != Color::Reset && cell.bg != Color::Reset));
             }
         }
+    }
+
+    #[test]
+    fn cards_show_each_agent_with_what_it_is_doing_and_its_children_inside() {
+        let mut main = agent("voe", vec![span("Read", 100, Some(1_000), false, false), span("Bash", 140, None, false, false)]);
+        main.id = "pid:1:main".into();
+        main.session_id = Some("main".into());
+        let child = |id: &str, parent: &str, nickname: &str, role: &str, state: AgentState| {
+            let mut c = agent(nickname, Vec::new());
+            c.id = format!("pid:1:main/{id}");
+            c.session_id = Some(id.into());
+            c.state = state;
+            c.counted_in_parent = true;
+            c.shares_process = true;
+            c.subagent = Some(agent_top_core::SubagentInfo {
+                parent_session_id: parent.into(),
+                nickname: Some(nickname.into()),
+                role: Some(role.into()),
+            });
+            c
+        };
+        let mut judge = child("j1", "wf_1", "judge:risk", "Judge", AgentState::Running);
+        judge.spans = vec![ToolSpan { kind: SpanKind::Inference, ..span("inference", 150, None, true, false) }];
+        let mut other = agent("other", Vec::new());
+        other.id = "pid:2".into();
+        other.session_id = Some("other".into());
+        other.state = AgentState::Idle;
+        let agents = vec![
+            main,
+            child("wf_1", "main", "deploy", "workflow", AgentState::Running),
+            judge,
+            child("r1", "wf_1", "research:x", "Research", AgentState::Stopped),
+            other,
+        ];
+        let mut app = App::new(snapshot(agents)).with_cards();
+        let out = render(&mut app, 140, 30);
+        assert!(!out.contains("HARNESS") && !out.contains("process tree"), "no table and no detail pane:\n{out}");
+        for want in [
+            "voe",
+            "⚙ Bash · 20s",
+            "recent Read 1.0s ✓",
+            "◆ deploy  workflow  ● 1 running  ✓ 1 done",
+            "● Judge 1 ━━▶ ✓ Research 1",
+            "╭ ● judge:risk ─",
+            "│✦ thinking · 10s",
+            "✓ research:x $1.42",
+            "other",
+            "◌ waiting for input",
+            "Enter details",
+        ] {
+            assert!(out.contains(want), "missing {want:?}:\n{out}");
+        }
+
+        // Once nothing under it is live, the card folds its subagents back into a summary line.
+        for a in app.snapshot.agents.iter_mut().filter(|a| a.counted_in_parent) {
+            a.state = AgentState::Stopped;
+        }
+        let mut app = App::new(app.snapshot.clone()).with_cards();
+        let out = render(&mut app, 140, 30);
+        assert!(out.contains("↳ ✓ deploy (workflow)  2 done") && !out.contains("◆ deploy"), "{out}");
+    }
+
+    #[test]
+    fn header_shows_the_output_rate_now_and_its_peak() {
+        let mut app = App::new(snapshot(vec![agent("worker", Vec::new())]));
+        app.output_rate = vec![15_000, 300, 1_234];
+        let out = render(&mut app, 160, 30);
+        let row = out.lines().find(|l| l.contains("out tok/s")).unwrap();
+        assert!(row.contains("out tok/s        1.2k") && row.contains("peak 15k"), "{row}");
     }
 
     #[test]

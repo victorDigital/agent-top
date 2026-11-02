@@ -478,6 +478,11 @@ pub trait SessionTracker {
     fn summary(&self) -> &SessionSummary;
     fn path(&self) -> &Path;
 
+    /// Subagents and workflow runs whose usage `summary` already includes.
+    fn children(&self) -> Vec<ChildSession> {
+        Vec::new()
+    }
+
     /// Ingest the whole file, however many refreshes that takes. For a
     /// one-shot read such as an export; the live collector spreads a large
     /// transcript over several ticks instead.
@@ -485,6 +490,13 @@ pub trait SessionTracker {
         while self.refresh()? {}
         Ok(())
     }
+}
+
+/// One child of a session: `summary.session_id` is its own id and `summary.subagent` names its parent.
+#[derive(Debug, Clone)]
+pub struct ChildSession {
+    pub summary: SessionSummary,
+    pub path: Option<PathBuf>,
 }
 
 /// What a harness's own registry says about one of its processes, when it

@@ -6,7 +6,9 @@
 //! the adapter for each root, and builds the rows.
 
 use crate::advice::RssTrend;
-use crate::harness::{self, AttributeContext, HarnessAdapter, McpUsage, RegistryHints, SessionSummary, SessionTracker, SpanRetention};
+use crate::harness::{
+    self, AttributeContext, ChildSession, HarnessAdapter, McpUsage, RegistryHints, SessionSummary, SessionTracker, SpanRetention,
+};
 use crate::model::*;
 use crate::process::{ProcessScanner, RawProc, build_forest};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -39,6 +41,8 @@ pub struct Collector {
     scanner: ProcessScanner,
     adapters: Vec<Box<dyn HarnessAdapter>>,
     trackers: HashMap<PathBuf, Box<dyn SessionTracker>>,
+    /// Transcripts the last refresh could not finish; the one that finishes them is still catching up.
+    behind: HashSet<PathBuf>,
     last_fs_scan: Option<Instant>,
     /// What is known about every MCP process seen this run, by pid, so that
     /// an orphan can say which agent it used to belong to. See `OrphanOrigin`.
@@ -113,6 +117,7 @@ impl Collector {
             scanner: ProcessScanner::new(),
             adapters: harness::adapters(),
             trackers: HashMap::new(),
+            behind: HashSet::new(),
             last_fs_scan: None,
             mcp_memory: HashMap::new(),
         }
@@ -151,6 +156,8 @@ impl Collector {
         let by_pid: HashMap<u32, &RawProc> = procs.iter().map(|p| (p.pid, p)).collect();
         let (roots, orphans) = build_forest(&procs);
 
+        let mut catching_up = false;
+        let mut still_behind = Vec::new();
         // Each adapter sees all of its processes before any is attributed.
         for a in &mut self.adapters {
             let mine: Vec<&ProcNode> = roots.iter().filter(|r| r.harness == Some(a.harness())).collect();
@@ -230,6 +237,7 @@ impl Collector {
                     parse_warning: None,
                     rate_limit: None,
                     harness_cost: None,
+                    counted_in_parent: false,
                 });
                 continue;
             }
@@ -237,16 +245,21 @@ impl Collector {
             let sessions: Vec<_> = paths
                 .iter()
                 .filter_map(|path| {
+                    let was_behind = self.behind.contains(path);
                     let tr = self.tracker_for(path, harness)?;
-                    let _ = tr.refresh();
-                    Some((path, tr.summary().clone()))
+                    let more = tr.refresh().unwrap_or(false);
+                    catching_up |= more || was_behind;
+                    if more {
+                        still_behind.push(path.clone());
+                    }
+                    Some((path, tr.summary().clone(), tr.children()))
                 })
                 .collect();
             // Count the host's resources once, preferring a main session over
             // its newest subagent. If only children are visible, one still
             // carries the shared process, never a guessed per-session share.
-            let process_owner = sessions.iter().position(|(_, s)| s.subagent.is_none()).unwrap_or(0);
-            for (i, (path, mut summary)) in sessions.into_iter().enumerate() {
+            let process_owner = sessions.iter().position(|(_, s, _)| s.subagent.is_none()).unwrap_or(0);
+            for (i, (path, mut summary, children)) in sessions.into_iter().enumerate() {
                 let owns_process = i == process_owner;
                 attached.insert(path.clone());
 
@@ -314,7 +327,10 @@ impl Collector {
                     parse_warning: parse_warning(&summary, harness),
                     rate_limit: summary.rate_limit.clone(),
                     harness_cost: summary.harness_cost,
+                    counted_in_parent: false,
                 });
+                let rows = child_rows(agents.last().unwrap(), children, now, &self.opts);
+                agents.extend(rows);
             }
         }
 
@@ -322,9 +338,15 @@ impl Collector {
         let stopped: Vec<(PathBuf, Harness)> =
             self.adapters.iter().flat_map(|a| a.unowned(&attached).into_iter().map(move |p| (p, a.harness()))).collect();
         for (p, harness) in stopped {
+            let was_behind = self.behind.contains(&p);
             let Some(tr) = self.tracker_for(&p, harness) else { continue };
-            let _ = tr.refresh();
+            let more = tr.refresh().unwrap_or(false);
+            catching_up |= more || was_behind;
+            if more {
+                still_behind.push(p.clone());
+            }
             let s = tr.summary().clone();
+            let children = tr.children();
             if s.turns == 0 && s.usage.total() == 0 {
                 continue;
             }
@@ -369,9 +391,13 @@ impl Collector {
                 parse_warning: parse_warning(&s, harness),
                 rate_limit: s.rate_limit.clone(),
                 harness_cost: s.harness_cost,
+                counted_in_parent: false,
             });
+            let rows = child_rows(agents.last().unwrap(), children, now, &self.opts);
+            agents.extend(rows);
         }
 
+        self.behind = still_behind.into_iter().collect();
         // Drop trackers for transcripts that fell out of the window.
         let keep: HashSet<&PathBuf> = agents.iter().filter_map(|a| a.session_path.as_ref()).collect();
         self.trackers.retain(|p, _| keep.contains(p));
@@ -387,6 +413,7 @@ impl Collector {
             orphan_origins,
             advice: Vec::new(),
             totals: Totals::default(),
+            catching_up,
         };
         snap.compute_totals();
         snap.advice = crate::advice::advise(&snap, &trends);
@@ -568,6 +595,74 @@ fn live_state(hints: &RegistryHints, activity: Activity, idle_secs: Option<u64>,
     }
 }
 
+/// A subagent is done once its transcript ends a turn; a quiet one past the stopped window is treated as abandoned.
+fn child_state(parent: AgentState, activity: Activity, idle_secs: Option<u64>, opts: &CollectorOptions) -> AgentState {
+    let idle = idle_secs.unwrap_or(u64::MAX);
+    if parent == AgentState::Stopped || activity == Activity::Waiting || idle > opts.stopped_window.as_secs() {
+        AgentState::Stopped
+    } else if idle > opts.activity_timeout.as_secs() {
+        AgentState::Idle
+    } else {
+        AgentState::Running
+    }
+}
+
+fn child_rows(parent: &Agent, children: Vec<ChildSession>, now: SystemTime, opts: &CollectorOptions) -> Vec<Agent> {
+    let secs_since = |t: Option<SystemTime>| t.and_then(|t| now.duration_since(t).ok()).map(|d| d.as_secs());
+    children
+        .into_iter()
+        .filter_map(|ChildSession { summary: s, path }| {
+            let idle_secs = secs_since(s.last_activity);
+            let state = child_state(parent.state, s.activity, idle_secs, opts);
+            if state == AgentState::Stopped && idle_secs.is_none_or(|i| i > opts.stopped_window.as_secs()) {
+                return None;
+            }
+            let sid = s.session_id.clone().unwrap_or_default();
+            Some(Agent {
+                id: format!("{}/{sid}", parent.id),
+                name: s.subagent.as_ref().and_then(|i| i.nickname.clone()).unwrap_or_else(|| sid.clone()),
+                harness: parent.harness,
+                state,
+                activity: s.activity,
+                pid: parent.pid,
+                session_id: Some(sid),
+                subagent: s.subagent.clone(),
+                session_path: path.or_else(|| parent.session_path.clone()),
+                cwd: s.cwd.clone().or_else(|| parent.cwd.clone()),
+                model: s.model.clone(),
+                harness_version: parent.harness_version.clone(),
+                usage: s.usage,
+                cost_usd: s.cost_usd,
+                cost_breakdown: s.cost_breakdown,
+                price_source: s.price_source.or_else(|| s.model.as_deref().and_then(|m| crate::pricing::table().source_for(m))),
+                unpriced_tokens: s.unpriced_tokens,
+                turns: s.turns,
+                subagent_turns: 0,
+                folds_child_usage: false,
+                tool_calls: s.tool_calls,
+                tool_calls_lower_bound: s.tool_calls_lower_bound,
+                web_searches: s.web_searches,
+                spans: s.spans.to_vec(),
+                age_secs: if state == AgentState::Stopped { idle_secs } else { secs_since(s.started_at) }.unwrap_or(0),
+                idle_secs,
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                process_count: 0,
+                mcp_count: 0,
+                mcp_servers: Vec::new(),
+                context: s.context.sources(),
+                tree: None,
+                attribution: parent.attribution,
+                shares_process: parent.pid.is_some(),
+                parse_warning: parse_warning(&s, parent.harness),
+                rate_limit: None,
+                harness_cost: None,
+                counted_in_parent: true,
+            })
+        })
+        .collect()
+}
+
 fn display_name(harness: Harness, cwd: Option<&Path>) -> String {
     match cwd.and_then(|c| c.file_name()).map(|f| f.to_string_lossy().into_owned()) {
         Some(dir) => format!("{}:{}", harness.label(), dir),
@@ -680,6 +775,54 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_read_over_several_ticks_flags_every_one_of_them_as_catching_up() {
+        struct Backlog {
+            path: PathBuf,
+            chunks_left: u32,
+            summary: SessionSummary,
+        }
+        impl SessionTracker for Backlog {
+            fn refresh(&mut self) -> anyhow::Result<bool> {
+                self.chunks_left = self.chunks_left.saturating_sub(1);
+                Ok(self.chunks_left > 0)
+            }
+            fn summary(&self) -> &SessionSummary {
+                &self.summary
+            }
+            fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+        struct Fixture(PathBuf);
+        impl HarnessAdapter for Fixture {
+            fn harness(&self) -> Harness {
+                Harness::Codex
+            }
+            fn rescan(&mut self, _since: SystemTime) {}
+            fn attribute(&self, _root: &ProcNode, _raw: Option<&RawProc>, _ctx: &AttributeContext) -> (Vec<PathBuf>, Attribution) {
+                (Vec::new(), Attribution::None)
+            }
+            fn unowned(&self, _attached: &HashSet<PathBuf>) -> Vec<PathBuf> {
+                vec![self.0.clone()]
+            }
+            fn open(&self, path: &Path, _spans: SpanRetention) -> Box<dyn SessionTracker> {
+                let summary = SessionSummary { turns: 1, ..Default::default() };
+                Box::new(Backlog { path: path.to_path_buf(), chunks_left: 3, summary })
+            }
+            fn detect(&self, _path: &Path) -> bool {
+                false
+            }
+            fn transcripts(&self) -> Vec<(String, PathBuf)> {
+                Vec::new()
+            }
+        }
+        let mut c = Collector::new(CollectorOptions::default());
+        c.adapters = vec![Box::new(Fixture(PathBuf::from("/nonexistent/backlog.jsonl")))];
+        let ticks: Vec<bool> = (0..4).map(|_| c.collect().catching_up).collect();
+        assert_eq!(ticks, vec![true, true, true, false], "the read that finishes the backlog is still catch-up");
+    }
+
+    #[test]
     fn the_registry_status_beats_the_transcript_heuristic() {
         let opts = CollectorOptions::default();
         let busy = RegistryHints { status: Some("busy".into()), ..Default::default() };
@@ -784,17 +927,8 @@ mod tests {
         }
     }
 
-    /// The RFC-104 success test, in miniature: a server seen under an agent
-    /// at one tick and among the orphans at the next says which agent it
-    /// came from; one that was an orphan from the start does not pretend to.
-    #[test]
-    fn an_orphan_remembers_the_agent_it_was_under() {
-        let mut c = Collector::new(CollectorOptions::default());
-        let t0 = UNIX_EPOCH + Duration::from_secs(1_000);
-        let t1 = t0 + Duration::from_secs(10);
-        let mut root = node(10, ProcKind::Agent, "claude");
-        root.children = vec![node(11, ProcKind::Mcp, "npx server-filesystem")];
-        let mut agent = Agent {
+    fn claude_row() -> Agent {
+        Agent {
             id: "pid:10".into(),
             name: "claude:proj".into(),
             harness: Harness::Claude,
@@ -827,13 +961,84 @@ mod tests {
             mcp_count: 1,
             mcp_servers: Vec::new(),
             context: Vec::new(),
-            tree: Some(root),
+            tree: None,
             attribution: Attribution::HarnessRegistry,
             shares_process: false,
             parse_warning: None,
             rate_limit: None,
             harness_cost: None,
+            counted_in_parent: false,
+        }
+    }
+
+    fn child(id: &str, activity: Activity, idle: Option<u64>, now: SystemTime) -> ChildSession {
+        let summary = SessionSummary {
+            session_id: Some(id.into()),
+            subagent: Some(SubagentInfo { parent_session_id: "main".into(), nickname: Some(id.into()), role: None }),
+            usage: TokenUsage { output: 10, ..Default::default() },
+            activity,
+            last_activity: idle.map(|s| now - Duration::from_secs(s)),
+            ..Default::default()
         };
+        ChildSession { summary, path: None }
+    }
+
+    #[test]
+    fn claude_children_nest_under_their_session_and_stay_out_of_the_totals() {
+        let opts = CollectorOptions::default();
+        let now = UNIX_EPOCH + Duration::from_secs(100_000);
+        let mut parent = claude_row();
+        parent.session_id = Some("main".into());
+        parent.usage = TokenUsage { output: 100, ..Default::default() };
+        let kids = || {
+            vec![
+                child("busy", Activity::Working, Some(5), now),
+                child("done", Activity::Waiting, Some(60), now),
+                child("long-done", Activity::Waiting, Some(2 * 3600), now),
+                child("silent", Activity::Unknown, None, now),
+            ]
+        };
+        let rows = child_rows(&parent, kids(), now, &opts);
+        let state = |id: &str| rows.iter().find(|a| a.session_id.as_deref() == Some(id)).map(|a| a.state);
+        assert_eq!(rows.len(), 2, "a child done for longer than the stopped window, or that never wrote, has no row");
+        assert_eq!(state("busy"), Some(AgentState::Running));
+        assert_eq!(state("done"), Some(AgentState::Stopped));
+        for r in &rows {
+            assert!(r.counted_in_parent && r.shares_process && r.tree.is_none());
+            assert_eq!((r.pid, r.cpu_percent, r.process_count), (Some(10), 0.0, 0));
+            assert!(r.id.starts_with("pid:10/"), "{}", r.id);
+        }
+
+        parent.state = AgentState::Stopped;
+        assert!(child_rows(&parent, kids(), now, &opts).iter().all(|a| a.state == AgentState::Stopped));
+
+        let mut snap = Snapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            taken_at: now,
+            host: HostStats::default(),
+            agents: std::iter::once(parent.clone()).chain(rows).collect(),
+            orphans: Vec::new(),
+            orphan_origins: Vec::new(),
+            advice: Vec::new(),
+            totals: Totals::default(),
+            catching_up: false,
+        };
+        snap.compute_totals();
+        assert_eq!((snap.totals.agents, snap.totals.tokens), (1, 100), "the parent already counts its children");
+    }
+
+    /// The RFC-104 success test, in miniature: a server seen under an agent
+    /// at one tick and among the orphans at the next says which agent it
+    /// came from; one that was an orphan from the start does not pretend to.
+    #[test]
+    fn an_orphan_remembers_the_agent_it_was_under() {
+        let mut c = Collector::new(CollectorOptions::default());
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(10);
+        let mut root = node(10, ProcKind::Agent, "claude");
+        root.children = vec![node(11, ProcKind::Mcp, "npx server-filesystem")];
+        let mut agent = claude_row();
+        agent.tree = Some(root);
         let procs = [raw(10, 5), raw(11, 6), raw(99, 7)];
         let by_pid: HashMap<u32, &RawProc> = procs.iter().map(|p| (p.pid, p)).collect();
 
@@ -912,6 +1117,7 @@ mod tests {
             parse_warning: None,
             rate_limit: None,
             harness_cost: None,
+            counted_in_parent: false,
         };
         let procs = [raw(10, 5), raw(11, 6)];
         let by_pid: HashMap<u32, &RawProc> = procs.iter().map(|p| (p.pid, p)).collect();
@@ -963,6 +1169,7 @@ mod tests {
             orphan_origins: Vec::new(),
             advice: Vec::new(),
             totals: Totals::default(),
+            catching_up: false,
         };
         let advice = crate::advice::advise(&snap, &trends);
         assert_eq!(advice.len(), 1, "{advice:#?}");

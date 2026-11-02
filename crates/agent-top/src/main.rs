@@ -1,6 +1,7 @@
 //! agent-top: htop for local coding agents.
 
 mod app;
+mod cards;
 mod format;
 mod listen;
 mod pane;
@@ -512,6 +513,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, source: &mut Source, start: &Sta
     if let Some(p) = start.pinned {
         app.standalone = true;
         app.pin(p);
+    } else {
+        app = app.with_cards();
     }
     app.multiplexer = pane::Multiplexer::detect();
     // The update check runs only for a live session, not a replayed snapshot,

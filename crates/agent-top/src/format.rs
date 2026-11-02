@@ -212,7 +212,7 @@ pub fn plain_table(snap: &Snapshot) -> String {
             }
         }
     }
-    let with_context: Vec<&Agent> = snap.agents.iter().filter(|a| !a.context.is_empty()).collect();
+    let with_context: Vec<&Agent> = snap.agents.iter().filter(|a| !a.context.is_empty() && !a.counted_in_parent).collect();
     if !with_context.is_empty() {
         out.push_str("\nCONTEXT BY SOURCE (tokens each tool's results added to the prompt; cost = every read since, est.)\n");
         for a in with_context {
@@ -354,6 +354,7 @@ mod advice_tests {
             orphan_origins: Vec::new(),
             advice: Vec::new(),
             totals: Totals::default(),
+            catching_up: false,
         };
         assert!(!plain_table(&snap).contains("ADVICE"));
         snap.advice.push(Advice {

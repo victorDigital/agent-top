@@ -55,7 +55,7 @@ pub struct RssTrend {
 /// Every piece of advice the snapshot supports, most expensive first.
 pub fn advise(snap: &Snapshot, trends: &HashMap<u32, RssTrend>) -> Vec<Advice> {
     let mut out = Vec::new();
-    for a in snap.agents.iter().filter(|a| a.state != AgentState::Stopped) {
+    for a in snap.agents.iter().filter(|a| a.state != AgentState::Stopped && !a.counted_in_parent) {
         for c in &a.context {
             if c.origin == ContextOrigin::Other || c.calls == 0 {
                 continue;
@@ -261,6 +261,7 @@ mod tests {
             parse_warning: None,
             rate_limit: None,
             harness_cost: None,
+            counted_in_parent: false,
         }
     }
 
@@ -293,6 +294,7 @@ mod tests {
             orphan_origins: Vec::new(),
             advice: Vec::new(),
             totals: Totals::default(),
+            catching_up: false,
         }
     }
 

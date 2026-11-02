@@ -524,6 +524,9 @@ pub struct Agent {
     /// `cost_usd` and never mixed into it. See `HarnessCost`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_cost: Option<HarnessCost>,
+    /// Usage already inside the parent row's (a Claude subagent or workflow), so totals skip this row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counted_in_parent: bool,
 }
 
 /// A harness's own running total for a session, read from its transcript.
@@ -778,12 +781,15 @@ pub struct Snapshot {
     #[serde(default)]
     pub advice: Vec<Advice>,
     pub totals: Totals,
+    /// A transcript had more to read than one refresh takes, so usage grew by catching up, not by work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catching_up: bool,
 }
 
 impl Snapshot {
     pub fn compute_totals(&mut self) {
         let mut t = Totals::default();
-        for a in &self.agents {
+        for a in self.agents.iter().filter(|a| !a.counted_in_parent) {
             t.agents += 1;
             match a.state {
                 AgentState::Running => t.running += 1,

@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- A card view is the default screen: one card per agent with a 10-minute activity bar, what it is doing now, its latest tool calls and its numbers. New cards are marked, finished ones fade out, and agents quiet for 15 minutes hide until `x`. Enter opens the table and detail pane; Esc comes back.
+- Claude Code subagents and Workflow runs get rows of their own, nested under their session and counted once in the totals. In the card view, a session with live subagents spans the width, with a tile per subagent and a workflow's phases as a pipeline.
+- The header shows the current output tokens per second and the window's peak beside the sparkline.
+
+### Changed
+- `agent-top-core`: `SessionTracker::children`, `Agent::counted_in_parent` and `Snapshot::catching_up`.
+
+### Fixed
+- Claude Code Workflow agents, kept under `<session>/subagents/workflows/<run>/`, are read and folded into their session; their tokens, cost and tool calls were missing.
+- Workflow and Agent-tool subagents that stop without a closing reply are recognised as finished, from the run's journal and the agent's meta file.
+- The output and burn rates no longer spike while a large transcript is read over several refreshes, or when a session appears with its history.
+
 ## [0.27.2] - 2026-10-28
 
 ### Changed

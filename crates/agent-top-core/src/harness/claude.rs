@@ -15,6 +15,7 @@
 //!   and the spawning `toolUseId`. The parent transcript no longer carries any
 //!   sidechain lines itself. Claude Code's own cost display includes those
 //!   files, so `ClaudeTranscript` tails and folds them in.
+//! * Workflow agents (2.1.316, 2026-11-02): `subagents/workflows/<run>/agent-<id>.jsonl`, same format.
 //! * A `tool_use` block in an assistant message and the `tool_result` block
 //!   that answers it carry the same id in `id` / `tool_use_id`, and their
 //!   lines carry the timestamps that bracket the call. That pairing is the
@@ -47,16 +48,19 @@
 //!   reconciled with it.
 
 use super::{
-    AttributeContext, HarnessAdapter, REFRESH_BUDGET_BYTES, RegistryHints, SessionSummary, SessionTracker, SourceStamp, SpanLog,
-    SpanRetention, mcp_server_of, parse_rfc3339_utc,
+    AttributeContext, ChildSession, HarnessAdapter, REFRESH_BUDGET_BYTES, RegistryHints, SessionSummary, SessionTracker, SourceStamp,
+    SpanLog, SpanRetention, mcp_server_of, parse_rfc3339_utc,
 };
 use crate::jsonl::TailReader;
-use crate::model::{Activity, Attribution, ContextOrigin, CostBreakdown, Harness, HarnessCost, ProcNode, SpanKind, TokenUsage};
+use crate::model::{
+    Activity, Attribution, ContextOrigin, CostBreakdown, Harness, HarnessCost, ProcNode, SpanKind, SubagentInfo, TokenUsage,
+};
 use crate::pricing::{self, Table};
 use crate::process::{RawProc, session_id_from_args};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -279,8 +283,7 @@ impl HarnessAdapter for ClaudeAdapter {
     /// subagent can write after the parent's last line.
     fn stamp(&self, path: &Path) -> Option<SourceStamp> {
         let main = SourceStamp::of_file(path)?;
-        let subs = subagents_dir(path).and_then(|d| std::fs::read_dir(d).ok());
-        Some(subs.into_iter().flatten().flatten().filter_map(|e| SourceStamp::of_file(&e.path())).fold(main, SourceStamp::with))
+        Some(subagent_transcripts(path).iter().filter_map(|p| SourceStamp::of_file(p)).fold(main, SourceStamp::with))
     }
 }
 
@@ -290,6 +293,15 @@ impl HarnessAdapter for ClaudeAdapter {
 pub fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
     let stem = transcript.file_stem()?;
     Some(transcript.with_file_name(stem).join("subagents"))
+}
+
+/// Agent-tool transcripts in `subagents/`, and Workflow agents' in `subagents/workflows/<run>/`.
+pub fn subagent_transcripts(transcript: &Path) -> Vec<PathBuf> {
+    let Some(dir) = subagents_dir(transcript) else { return Vec::new() };
+    let list = |d: &Path| std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
+    let top = list(&dir);
+    let runs = top.iter().filter(|p| p.file_name() == Some(OsStr::new("workflows"))).flat_map(|w| list(w)).flat_map(|r| list(&r));
+    top.iter().cloned().chain(runs).filter(|p| p.extension() == Some(OsStr::new("jsonl")) && is_subagent_transcript(p)).collect()
 }
 
 /// One JSONL file being tailed into a `SessionSummary`: the main transcript,
@@ -621,7 +633,13 @@ impl Parser {
 pub struct ClaudeTranscript {
     main: Parser,
     /// Keyed by path, so a directory listing adds each subagent once.
-    subagents: BTreeMap<PathBuf, Parser>,
+    subagents: BTreeMap<PathBuf, Subagent>,
+    /// Workflow run id to the name its script was saved under.
+    run_names: HashMap<String, String>,
+    /// Each run's `journal.jsonl`, which records an agent's result when it finishes.
+    journals: BTreeMap<String, TailReader>,
+    /// Agent ids a journal has recorded a result for.
+    finished: HashSet<String>,
     prices: &'static Table,
     retention: SpanRetention,
     /// The fold of `main` and `subagents`, rebuilt whenever any of them read
@@ -635,6 +653,9 @@ impl ClaudeTranscript {
         ClaudeTranscript {
             main: Parser::new(path, retention),
             subagents: BTreeMap::new(),
+            run_names: HashMap::new(),
+            journals: BTreeMap::new(),
+            finished: HashSet::new(),
             prices: pricing::table(),
             retention,
             summary: SessionSummary { harness: Some(Harness::Claude), folds_child_usage: true, ..Default::default() },
@@ -652,8 +673,8 @@ impl ClaudeTranscript {
     pub fn with_spans(mut self, retention: SpanRetention) -> Self {
         self.retention = retention;
         self.main.summary.spans = retention.log();
-        for p in self.subagents.values_mut() {
-            p.summary.spans = retention.log();
+        for c in self.subagents.values_mut() {
+            c.parser.summary.spans = retention.log();
         }
         self
     }
@@ -671,42 +692,52 @@ impl ClaudeTranscript {
         self.fold();
     }
 
-    /// Pick up subagent transcripts that appeared since the last look. One
-    /// directory listing per refresh; the directory is small and usually
-    /// absent, so this is a single failed `open` for most sessions.
+    /// Pick up subagent transcripts that appeared since the last look. The
+    /// directory is usually absent, so this is a single failed `open` for most sessions.
     fn discover_subagents(&mut self) {
-        let Some(dir) = subagents_dir(self.main.reader.path()) else { return };
-        let Ok(rd) = std::fs::read_dir(&dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") || self.subagents.contains_key(&p) {
-                continue;
+        for p in subagent_transcripts(self.main.reader.path()) {
+            if !self.subagents.contains_key(&p) {
+                let run = workflow_run_of(&p);
+                if let Some(run) = &run
+                    && !self.run_names.contains_key(run)
+                {
+                    let name = workflow_name(self.main.reader.path(), run).unwrap_or_else(|| run.clone());
+                    self.run_names.insert(run.clone(), name);
+                    if let Some(dir) = p.parent() {
+                        self.journals.insert(run.clone(), TailReader::new(dir.join("journal.jsonl")));
+                    }
+                }
+                let sub =
+                    Subagent { parser: Parser::new(&p, self.retention), run, label: None, role: None, meta_read: false, finished: false };
+                self.subagents.insert(p, sub);
             }
-            let parser = Parser::new(&p, self.retention);
-            self.subagents.insert(p, parser);
+        }
+        // An Agent-tool subagent's meta file gains `finished` when it returns; a workflow agent's never does.
+        for (p, c) in self.subagents.iter_mut().filter(|(_, c)| !c.meta_read || (c.run.is_none() && !c.finished)) {
+            c.read_meta(p);
+        }
+    }
+
+    /// Workflow agents can stop after their last tool result without writing a closing reply; the journal knows.
+    fn read_journals(&mut self) {
+        for j in self.journals.values_mut() {
+            let Ok((lines, _)) = j.read_new_lines(REFRESH_BUDGET_BYTES) else { continue };
+            for l in lines {
+                let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
+                if v.get("type").and_then(Value::as_str) != Some("started")
+                    && let Some(id) = v.get("agentId").and_then(Value::as_str)
+                {
+                    self.finished.insert(id.to_string());
+                }
+            }
         }
     }
 
     fn fold(&mut self) {
         let mut s = self.main.summary.clone();
         for c in self.subagents.values() {
-            let t = &c.summary;
-            s.usage.add(&t.usage);
-            s.cost_usd += t.cost_usd;
-            s.cost_breakdown.add(&t.cost_breakdown);
-            s.unpriced_tokens += t.unpriced_tokens;
-            s.turns += t.turns;
-            s.subagent_turns += t.subagent_turns;
-            s.tool_calls += t.tool_calls;
-            s.web_searches += t.web_searches;
-            s.health.billable_messages += t.health.billable_messages;
-            s.health.usage_records += t.health.usage_records;
-            s.health.empty_usage_records += t.health.empty_usage_records;
-            s.last_activity = s.last_activity.max(t.last_activity);
-            for (server, u) in &t.mcp {
-                s.mcp.entry(server.clone()).or_default().add(u);
-            }
-            s.context.merge(&t.context);
+            let t = &c.parser.summary;
+            absorb(&mut s, t);
             // A subagent that wrote after the record ran after that exit.
             if let Some(h) = &mut s.harness_cost
                 && t.last_activity > h.as_of
@@ -716,11 +747,70 @@ impl ClaudeTranscript {
             }
         }
         if !self.subagents.is_empty() {
-            let logs = std::iter::once(&self.main.summary.spans).chain(self.subagents.values().map(|c| &c.summary.spans));
+            let logs = std::iter::once(&self.main.summary.spans).chain(self.subagents.values().map(|c| &c.parser.summary.spans));
             s.spans = SpanLog::merged(logs, self.main.summary.spans.cap());
         }
         self.summary = s;
     }
+}
+
+struct Subagent {
+    parser: Parser,
+    run: Option<String>,
+    label: Option<String>,
+    role: Option<String>,
+    meta_read: bool,
+    finished: bool,
+}
+
+impl Subagent {
+    /// `agent-<id>.meta.json` can land after the transcript, so a miss is retried next refresh.
+    fn read_meta(&mut self, transcript: &Path) {
+        let Ok(text) = std::fs::read_to_string(transcript.with_extension("meta.json")) else { return };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else { return };
+        let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        self.label = field("description");
+        self.role = field("workflowPhase").or_else(|| field("agentType"));
+        self.finished = v.get("finished").and_then(Value::as_bool).unwrap_or(false);
+        self.meta_read = true;
+    }
+}
+
+fn absorb(s: &mut SessionSummary, t: &SessionSummary) {
+    s.usage.add(&t.usage);
+    s.cost_usd += t.cost_usd;
+    s.cost_breakdown.add(&t.cost_breakdown);
+    s.unpriced_tokens += t.unpriced_tokens;
+    s.turns += t.turns;
+    s.subagent_turns += t.subagent_turns;
+    s.tool_calls += t.tool_calls;
+    s.web_searches += t.web_searches;
+    s.health.billable_messages += t.health.billable_messages;
+    s.health.usage_records += t.health.usage_records;
+    s.health.empty_usage_records += t.health.empty_usage_records;
+    s.last_activity = s.last_activity.max(t.last_activity);
+    for (server, u) in &t.mcp {
+        s.mcp.entry(server.clone()).or_default().add(u);
+    }
+    s.context.merge(&t.context);
+}
+
+fn workflow_run_of(transcript: &Path) -> Option<String> {
+    let run = transcript.parent()?;
+    if run.parent()?.file_name()? != "workflows" {
+        return None;
+    }
+    run.file_name()?.to_str().map(str::to_string)
+}
+
+/// Claude Code saves a run's script as `<session>/workflows/scripts/<name>-<run>.js`.
+fn workflow_name(transcript: &Path, run: &str) -> Option<String> {
+    let scripts = transcript.with_file_name(transcript.file_stem()?).join("workflows").join("scripts");
+    let suffix = format!("-{run}.js");
+    std::fs::read_dir(scripts)
+        .ok()?
+        .flatten()
+        .find_map(|e| e.file_name().to_str()?.strip_suffix(&suffix).filter(|n| !n.is_empty()).map(str::to_string))
 }
 
 fn same_message_id(a: Option<&str>, b: Option<&str>) -> bool {
@@ -754,9 +844,10 @@ impl SessionTracker for ClaudeTranscript {
     fn refresh(&mut self) -> anyhow::Result<bool> {
         let (mut ingested, mut more) = self.main.refresh(self.prices)?;
         self.discover_subagents();
+        self.read_journals();
         for c in self.subagents.values_mut() {
             // One unreadable subagent file must not take the session with it.
-            if let Ok((n, m)) = c.refresh(self.prices) {
+            if let Ok((n, m)) = c.parser.refresh(self.prices) {
                 ingested += n;
                 more |= m;
             }
@@ -773,6 +864,56 @@ impl SessionTracker for ClaudeTranscript {
 
     fn path(&self) -> &Path {
         self.main.reader.path()
+    }
+
+    /// Each subagent, and one row per workflow run that sums its agents.
+    fn children(&self) -> Vec<ChildSession> {
+        let path = self.main.reader.path();
+        let stem = || path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let parent = self.summary.session_id.clone().unwrap_or_else(stem);
+        let mut out = Vec::new();
+        let mut runs: BTreeMap<&str, Vec<SessionSummary>> = BTreeMap::new();
+        for (p, c) in &self.subagents {
+            let mut s = c.parser.summary.clone();
+            let id = p.file_stem().and_then(|f| f.to_str()).map(|f| f.trim_start_matches("agent-").to_string());
+            s.subagent = Some(SubagentInfo {
+                parent_session_id: c.run.clone().unwrap_or_else(|| parent.clone()),
+                nickname: c.label.clone(),
+                role: c.role.clone(),
+            });
+            if c.finished || id.as_ref().is_some_and(|id| self.finished.contains(id)) {
+                s.activity = Activity::Waiting;
+            }
+            s.session_id = id;
+            if let Some(run) = &c.run {
+                runs.entry(run).or_default().push(s.clone());
+            }
+            out.push(ChildSession { summary: s, path: Some(p.clone()) });
+        }
+        for (run, agents) in runs {
+            let working = agents.iter().any(|a| a.activity == Activity::Working);
+            let mut s = SessionSummary {
+                harness: Some(Harness::Claude),
+                session_id: Some(run.to_string()),
+                subagent: Some(SubagentInfo {
+                    parent_session_id: parent.clone(),
+                    nickname: self.run_names.get(run).cloned(),
+                    role: Some("workflow".into()),
+                }),
+                cwd: self.summary.cwd.clone(),
+                model: agents.iter().find_map(|a| a.model.clone()),
+                harness_version: self.summary.harness_version.clone(),
+                activity: if working { Activity::Working } else { Activity::Waiting },
+                started_at: agents.iter().filter_map(|a| a.started_at).min(),
+                spans: SpanLog::merged(agents.iter().map(|a| &a.spans), self.main.summary.spans.cap()),
+                ..Default::default()
+            };
+            for a in &agents {
+                absorb(&mut s, a);
+            }
+            out.push(ChildSession { summary: s, path: None });
+        }
+        out
     }
 }
 
@@ -1080,6 +1221,124 @@ mod tests {
         t.refresh().unwrap();
         assert_eq!(t.summary().usage.total(), 1212);
         assert_eq!(t.summary().subagent_turns, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folds_workflow_agent_transcripts_into_the_parent() {
+        let dir = std::env::temp_dir().join(format!("agent-top-claude-wf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"assistant","timestamp":"2026-11-02T08:00:00.000Z","sessionId":"abc","cwd":"/tmp/p","message":{{"id":"m1","model":"claude-sonnet-5","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_wf","name":"Workflow"}}],"usage":{{"input_tokens":100,"output_tokens":10}}}}}}"#).unwrap();
+        let run = subagents_dir(&path).unwrap().join("workflows").join("wf_1");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("journal.jsonl"), "{\"type\":\"launched\"}\n").unwrap();
+        std::fs::write(run.join("agent-a1.meta.json"), r#"{"agentType":"workflow-subagent"}"#).unwrap();
+        for (id, ts) in [("a1", "01"), ("a2", "02")] {
+            let mut g = std::fs::File::create(run.join(format!("agent-{id}.jsonl"))).unwrap();
+            writeln!(g, r#"{{"type":"assistant","timestamp":"2026-11-02T08:00:{ts}.000Z","sessionId":"abc","isSidechain":true,"agentId":"{id}","message":{{"id":"s_{id}","model":"claude-sonnet-5","stop_reason":"end_turn","content":[],"usage":{{"input_tokens":1000,"output_tokens":100}}}}}}"#).unwrap();
+        }
+        let mut t = ClaudeTranscript::new(&path).with_prices(pricing::builtin_table());
+        t.refresh().unwrap();
+        let s = t.summary();
+        assert_eq!(s.usage.total(), 110 + 2 * 1100);
+        assert_eq!(s.subagent_turns, 2);
+        let found = subagent_transcripts(&path);
+        assert_eq!(found.len(), 2, "the journal and meta files are not transcripts: {found:?}");
+        let stamp = ClaudeAdapter::default().stamp(&path).unwrap();
+        assert_eq!(stamp.size, found.iter().chain([&path]).map(|p| std::fs::metadata(p).unwrap().len()).sum::<u64>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lists_subagents_and_workflow_runs_as_children() {
+        let dir = std::env::temp_dir().join(format!("agent-top-claude-children-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "{\"type\":\"user\",\"timestamp\":\"2026-11-02T08:00:00.000Z\",\"sessionId\":\"abc\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n").unwrap();
+        let line = |id: &str, ts: &str, stop: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-11-02T08:00:{ts}.000Z\",\"sessionId\":\"abc\",\"isSidechain\":true,\"agentId\":\"{id}\",\"message\":{{\"id\":\"m_{id}\",\"model\":\"claude-sonnet-5\",\"stop_reason\":\"{stop}\",\"content\":[],\"usage\":{{\"input_tokens\":100,\"output_tokens\":10}}}}}}\n"
+            )
+        };
+        let flat = subagents_dir(&path).unwrap();
+        let run = flat.join("workflows").join("wf_1");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::create_dir_all(dir.join("s").join("workflows").join("scripts")).unwrap();
+        std::fs::write(dir.join("s").join("workflows").join("scripts").join("deploy-plan-wf_1.js"), "").unwrap();
+        std::fs::write(flat.join("agent-a1.jsonl"), line("a1", "01", "tool_use")).unwrap();
+        std::fs::write(flat.join("agent-a1.meta.json"), r#"{"agentType":"Explore","description":"Find callers"}"#).unwrap();
+        std::fs::write(run.join("agent-w1.jsonl"), line("w1", "02", "end_turn")).unwrap();
+        std::fs::write(
+            run.join("agent-w1.meta.json"),
+            r#"{"agentType":"workflow-subagent","description":"research:x","workflowPhase":"Research"}"#,
+        )
+        .unwrap();
+        std::fs::write(run.join("agent-w2.jsonl"), line("w2", "03", "end_turn")).unwrap();
+        std::fs::write(run.join("journal.jsonl"), "{\"type\":\"launched\"}\n").unwrap();
+
+        let mut t = ClaudeTranscript::new(&path).with_prices(pricing::builtin_table());
+        t.refresh().unwrap();
+        let kids = t.children();
+        let find = |id: &str| kids.iter().find(|c| c.summary.session_id.as_deref() == Some(id)).unwrap();
+        let info = |id: &str| find(id).summary.subagent.clone().unwrap();
+        assert_eq!(kids.len(), 4, "two workflow agents, one Agent-tool subagent, one run");
+        assert_eq!(
+            info("a1"),
+            SubagentInfo { parent_session_id: "abc".into(), nickname: Some("Find callers".into()), role: Some("Explore".into()) }
+        );
+        assert_eq!(find("a1").summary.activity, Activity::Working);
+        assert_eq!(
+            info("w1"),
+            SubagentInfo { parent_session_id: "wf_1".into(), nickname: Some("research:x".into()), role: Some("Research".into()) }
+        );
+        assert_eq!(info("w2").nickname, None, "no meta file yet");
+        assert_eq!(
+            info("wf_1"),
+            SubagentInfo { parent_session_id: "abc".into(), nickname: Some("deploy-plan".into()), role: Some("workflow".into()) }
+        );
+        let wf = &find("wf_1").summary;
+        assert_eq!(wf.usage.total(), 220, "a run sums its agents, not the Agent-tool subagent");
+        assert_eq!(wf.activity, Activity::Waiting, "both its agents ended their turn");
+        assert!(find("wf_1").path.is_none());
+        assert_eq!(t.summary().usage.total(), 330, "the parent still folds every child in");
+
+        std::fs::write(run.join("agent-w2.meta.json"), r#"{"description":"research:y","workflowPhase":"Research"}"#).unwrap();
+        t.refresh().unwrap();
+        assert_eq!(
+            t.children()
+                .iter()
+                .find(|c| c.summary.session_id.as_deref() == Some("w2"))
+                .unwrap()
+                .summary
+                .subagent
+                .as_ref()
+                .unwrap()
+                .nickname
+                .as_deref(),
+            Some("research:y")
+        );
+        // Agents that stop after a tool result write no closing reply; the journal and meta file say they are done.
+        std::fs::write(run.join("agent-w3.jsonl"), line("w3", "04", "tool_use")).unwrap();
+        t.refresh().unwrap();
+        let activity = |t: &ClaudeTranscript, id: &str| {
+            t.children().into_iter().find(|c| c.summary.session_id.as_deref() == Some(id)).unwrap().summary.activity
+        };
+        assert_eq!(activity(&t, "w3"), Activity::Working);
+        assert_eq!(activity(&t, "wf_1"), Activity::Working);
+        std::fs::write(
+            run.join("journal.jsonl"),
+            "{\"type\":\"launched\"}\n{\"type\":\"started\",\"agentId\":\"w3\"}\n{\"type\":\"result\",\"agentId\":\"w3\"}\n",
+        )
+        .unwrap();
+        std::fs::write(flat.join("agent-a1.meta.json"), r#"{"agentType":"Explore","description":"Find callers","finished":true}"#).unwrap();
+        t.refresh().unwrap();
+        assert_eq!(activity(&t, "w3"), Activity::Waiting);
+        assert_eq!(activity(&t, "wf_1"), Activity::Waiting);
+        assert_eq!(activity(&t, "a1"), Activity::Waiting);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

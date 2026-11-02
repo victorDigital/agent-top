@@ -41,6 +41,41 @@ impl SortKey {
     }
 }
 
+/// What fills the space between the header and the key bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// One card per agent, with its activity and what it is doing.
+    Cards,
+    /// The table with the detail pane under it.
+    Table,
+}
+
+/// How long a new agent's card is marked as new.
+pub const NEW_FOR: Duration = Duration::from_secs(5);
+/// How long a finished agent's card stays before it goes, when stopped agents are hidden.
+pub const FADE_FOR: Duration = Duration::from_secs(20);
+
+/// A card whose agent has not written for this long hides until `x`, unless a subagent of it is still active.
+pub const QUIET_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Not running, and nothing written for `QUIET_AFTER`.
+pub fn is_quiet(a: &Agent) -> bool {
+    a.state != AgentState::Running && a.idle_secs.is_some_and(|s| s > QUIET_AFTER.as_secs())
+}
+
+/// Live and not quiet: what earns a card, a tile, or a running count.
+pub fn is_active(a: &Agent) -> bool {
+    a.state != AgentState::Stopped && !is_quiet(a)
+}
+
+/// When the app first saw an agent and when it last saw it live.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Presence {
+    /// `None` for agents already there when the app started: they are not new.
+    pub first_seen: Option<Instant>,
+    pub last_live: Option<Instant>,
+}
+
 /// Which panel the right half of the detail pane shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailView {
@@ -241,14 +276,28 @@ pub struct App {
     /// A one-line message for the footer, with when it was set.
     pub notice: Option<(String, Instant)>,
     pub show_stopped: bool,
+    pub view: View,
+    /// The view Esc returns to from the other one.
+    pub home: View,
+    /// Card-grid lines scrolled off the top; the renderer keeps the selection in view.
+    pub card_scroll: u16,
+    /// Keyed by `card_key`, so a session keeps its history when its row id changes on exit.
+    pub presence: HashMap<String, Presence>,
+    presence_primed: bool,
+    /// When the current snapshot arrived.
+    pub tick: Instant,
     pub paused: bool,
     pub cpu_history: Vec<u64>,
     /// Output tokens per second across every agent, one entry per tick.
     pub output_rate: Vec<u64>,
     pub cost_history: Vec<u64>,
-    /// (when, output tokens across every agent) for the last `RATE_WINDOW`.
+    /// Each agent's output tokens and cost at the last tick, by `card_key`, to measure what it added since.
+    last_usage: HashMap<String, (u64, f64)>,
+    /// Output tokens and micro-dollars produced while watching; catch-up reads and rows that just appeared add nothing.
+    produced: (u64, u64),
+    /// (when, `produced` output tokens) for the last `RATE_WINDOW`.
     rate_samples: VecDeque<(Instant, u64)>,
-    /// (when, cumulative cost in micro-dollars) for the last `BURN_WINDOW`.
+    /// (when, `produced` micro-dollars) for the last `BURN_WINDOW`.
     cost_samples: VecDeque<(Instant, u64)>,
     /// Current spend velocity across every agent, US dollars per hour.
     pub burn_per_hour: f64,
@@ -286,10 +335,18 @@ impl App {
             open_requested: None,
             notice: None,
             show_stopped: true,
+            view: View::Table,
+            home: View::Table,
+            card_scroll: 0,
+            presence: HashMap::new(),
+            presence_primed: false,
+            tick: Instant::now(),
             paused: false,
             cpu_history: Vec::new(),
             output_rate: Vec::new(),
             cost_history: Vec::new(),
+            last_usage: HashMap::new(),
+            produced: (0, 0),
             rate_samples: VecDeque::new(),
             cost_samples: VecDeque::new(),
             burn_per_hour: 0.0,
@@ -299,8 +356,86 @@ impl App {
             installer: crate::update::Installer::Unknown,
             upgrade_requested: None,
         };
+        app.note_presence(app.tick);
+        growth(&mut app.last_usage, &app.snapshot);
         app.rebuild_rows();
         app
+    }
+
+    /// Start on the cards, with stopped agents hidden once their card has faded.
+    pub fn with_cards(mut self) -> Self {
+        self.view = View::Cards;
+        self.home = View::Cards;
+        self.show_stopped = false;
+        self.rebuild_rows();
+        self
+    }
+
+    fn note_presence(&mut self, now: Instant) {
+        let primed = self.presence_primed;
+        for a in &self.snapshot.agents {
+            let p = self.presence.entry(card_key(a)).or_insert(Presence { first_seen: primed.then_some(now), last_live: None });
+            if a.state != AgentState::Stopped {
+                p.last_live = Some(now);
+            }
+        }
+        let present: std::collections::HashSet<String> = self.snapshot.agents.iter().map(card_key).collect();
+        self.presence.retain(|k, p| present.contains(k) || p.last_live.is_some_and(|t| now.duration_since(t) < FADE_FOR));
+        self.presence_primed = true;
+        self.tick = now;
+    }
+
+    pub fn is_new(&self, a: &Agent) -> bool {
+        self.presence.get(&card_key(a)).and_then(|p| p.first_seen).is_some_and(|t| self.tick.duration_since(t) < NEW_FOR)
+    }
+
+    /// A stopped agent that was live moments ago keeps its card for `FADE_FOR`.
+    pub fn is_fading(&self, a: &Agent) -> bool {
+        a.state == AgentState::Stopped
+            && self.presence.get(&card_key(a)).and_then(|p| p.last_live).is_some_and(|t| self.tick.duration_since(t) < FADE_FOR)
+    }
+
+    /// Indexes into `rows` of the agents that get a card: the roots of the session tree.
+    pub fn card_roots(&self) -> Vec<usize> {
+        (0..self.rows.len())
+            .filter(|&i| self.row_depths[i] == 0)
+            .filter(|&i| self.show_stopped || self.is_fading(&self.rows[i]) || is_active(&self.rows[i]) || self.has_active_child(i))
+            .collect()
+    }
+
+    fn has_active_child(&self, root: usize) -> bool {
+        (root + 1..self.rows.len()).take_while(|&i| self.row_depths[i] > 0).any(|i| is_active(&self.rows[i]))
+    }
+
+    /// Cards hidden because their agent stopped or went quiet.
+    pub fn hidden_cards(&self) -> usize {
+        self.row_depths.iter().filter(|&&d| d == 0).count() - self.card_roots().len()
+    }
+
+    /// The card holding row `i`: its nearest root.
+    pub fn root_of(&self, i: usize) -> usize {
+        (0..=i.min(self.rows.len().saturating_sub(1))).rev().find(|&j| self.row_depths[j] == 0).unwrap_or(0)
+    }
+
+    fn move_card(&mut self, code: KeyCode) {
+        let roots = self.card_roots();
+        if roots.is_empty() {
+            return;
+        }
+        let here = self.root_of(self.selected);
+        let at = roots.iter().position(|&r| r == here);
+        let last = roots.len() - 1;
+        let to = match (code, at) {
+            (KeyCode::Char('g') | KeyCode::Home, _) => 0,
+            (KeyCode::Char('G') | KeyCode::End, _) => last,
+            (_, None) => 0,
+            (KeyCode::Char('j') | KeyCode::Down, Some(p)) => (p + 1).min(last),
+            (KeyCode::Char('k') | KeyCode::Up, Some(p)) => p.saturating_sub(1),
+            (KeyCode::PageDown, Some(p)) => (p + 5).min(last),
+            (KeyCode::PageUp, Some(p)) => p.saturating_sub(5),
+            (_, Some(p)) => p,
+        };
+        self.select(roots[to]);
     }
 
     /// The newer version the update check knows of, if any.
@@ -348,8 +483,12 @@ impl App {
         // Output only: cache reads and prompt tokens are the context being
         // re-sent, not work being produced, and they dwarf the output by a
         // hundred to one on a long session.
-        let output: u64 = snapshot.agents.iter().map(|a| a.usage.output).sum();
-        self.rate_samples.push_back((now, output));
+        let (output, micros) = growth(&mut self.last_usage, &snapshot);
+        if !snapshot.catching_up {
+            self.produced.0 += output;
+            self.produced.1 += micros;
+        }
+        self.rate_samples.push_back((now, self.produced.0));
         // Keep the newest sample that is at least a window old as the anchor,
         // so the rate always spans a full window once there is that much
         // history.
@@ -360,20 +499,21 @@ impl App {
         push(&mut self.cost_history, (snapshot.totals.cost_usd * 100.0) as u64);
         // Spend velocity: the cost added over the burn window, projected to an
         // hour. Cost only climbs, so an idle machine reads zero.
-        let cost_micros = (snapshot.totals.cost_usd * 1_000_000.0) as u64;
-        self.cost_samples.push_back((now, cost_micros));
+        self.cost_samples.push_back((now, self.produced.1));
         while self.cost_samples.len() > 2 && self.cost_samples[1].0 + BURN_WINDOW <= now {
             self.cost_samples.pop_front();
         }
         self.burn_per_hour = burn_per_hour(&self.cost_samples);
         self.snapshot = snapshot;
+        self.note_presence(now);
         self.rebuild_rows();
         self.maybe_prompt_update();
     }
 
     pub fn rebuild_rows(&mut self) {
         let mut rows: Vec<Agent> =
-            self.snapshot.agents.iter().filter(|a| self.show_stopped || a.state != AgentState::Stopped).cloned().collect();
+            // Cards count finished children and fade finished agents out, so they keep every row.
+            self.snapshot.agents.iter().filter(|a| self.view == View::Cards || self.show_stopped || a.state != AgentState::Stopped).cloned().collect();
         let key = self.sort;
         rows.sort_by(|a, b| {
             let ord = match key {
@@ -400,6 +540,12 @@ impl App {
             self.selected = 0;
         } else if self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
+        }
+        if self.view == View::Cards {
+            let roots = self.card_roots();
+            if !roots.is_empty() && !roots.contains(&self.root_of(self.selected)) {
+                self.selected = roots[0];
+            }
         }
         self.selected_id = self.rows.get(self.selected).map(|a| a.id.clone());
     }
@@ -467,6 +613,10 @@ impl App {
     /// move the table's selection otherwise.
     fn scroll_or_select(&mut self, code: KeyCode) {
         let page: u16 = 10;
+        if self.pinned.is_none() && self.view == View::Cards {
+            self.move_card(code);
+            return;
+        }
         if self.pinned.is_some() && self.overlay == Overlay::None {
             self.scroll = match code {
                 KeyCode::Char('j') | KeyCode::Down => self.scroll.saturating_add(1),
@@ -536,6 +686,11 @@ impl App {
                     self.pin(p);
                 }
             }
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Char('v') if self.pinned.is_none() && self.view == View::Cards => {
+                self.view = View::Table;
+                self.show_detail = true;
+                self.rebuild_rows();
+            }
             KeyCode::Char('t') | KeyCode::Enter if self.pinned.is_none() => self.show_detail = !self.show_detail,
             // `o` asks the main loop to open the panel in front in a pane of
             // the multiplexer; without one there is nothing to ask. The peek
@@ -579,6 +734,9 @@ impl App {
                     self.close_overlay();
                 } else if self.pinned.is_some() && !self.standalone {
                     self.unpin();
+                } else if self.view != self.home {
+                    self.view = self.home;
+                    self.rebuild_rows();
                 } else if self.pinned.is_none() {
                     return true;
                 }
@@ -599,6 +757,27 @@ impl App {
     fn toggle(&mut self, o: Overlay) {
         self.overlay = if self.overlay == o { Overlay::None } else { o };
     }
+}
+
+/// Output tokens and micro-dollars each agent added since the last call; an agent seen for the first time adds nothing.
+fn growth(last: &mut HashMap<String, (u64, f64)>, snap: &Snapshot) -> (u64, u64) {
+    let (mut output, mut usd) = (0, 0.0);
+    let mut seen = HashMap::new();
+    for a in snap.agents.iter().filter(|a| !a.counted_in_parent) {
+        let key = card_key(a);
+        if let Some(&(o, c)) = last.get(&key) {
+            output += a.usage.output.saturating_sub(o);
+            usd += (a.cost_usd - c).max(0.0);
+        }
+        seen.insert(key, (a.usage.output, a.cost_usd));
+    }
+    *last = seen;
+    (output, (usd * 1_000_000.0) as u64)
+}
+
+/// One identity per session across its live and stopped rows, whose `id`s differ.
+pub fn card_key(a: &Agent) -> String {
+    format!("{}|{}", a.harness.label(), a.session_id.as_deref().unwrap_or(&a.id))
 }
 
 /// Output tokens per second between the oldest and newest sample. An agent
@@ -680,6 +859,7 @@ mod tests {
             parse_warning: None,
             rate_limit: None,
             harness_cost: None,
+            counted_in_parent: false,
         };
         let mut s = Snapshot {
             schema_version: agent_top_core::SNAPSHOT_SCHEMA_VERSION,
@@ -690,6 +870,7 @@ mod tests {
             orphan_origins: Vec::new(),
             advice: Vec::new(),
             totals: Totals::default(),
+            catching_up: false,
         };
         s.compute_totals();
         s
@@ -1049,5 +1230,90 @@ mod tests {
         app.update_at(snapshot(0), t0);
         app.update_at(snapshot(50), t0 + Duration::from_millis(500));
         assert_eq!(app.output_rate.last(), Some(&100), "50 tokens in half a second");
+    }
+
+    #[test]
+    fn a_finished_agent_fades_out_and_a_new_one_is_marked() {
+        let t0 = Instant::now();
+        let with = |agents: Vec<Agent>| {
+            let mut s = snapshot(0);
+            s.agents = agents;
+            s.compute_totals();
+            s
+        };
+        let a = session("a", None, 0);
+        let mut app = session_app(vec![a.clone()]).with_cards();
+        app.update_at(with(vec![a.clone()]), t0);
+        assert!(!app.is_new(&app.rows[0]), "agents already there at start are not new");
+
+        let mut stopped = a.clone();
+        stopped.state = AgentState::Stopped;
+        stopped.id = "session:a".into();
+        app.update_at(with(vec![stopped.clone()]), t0 + Duration::from_secs(1));
+        assert_eq!(app.card_roots().len(), 1, "a card stays a moment after its agent stops");
+        app.update_at(with(vec![stopped.clone()]), t0 + FADE_FOR + Duration::from_secs(2));
+        assert!(app.card_roots().is_empty(), "then it goes");
+
+        let b = session("b", None, 0);
+        app.update_at(with(vec![stopped.clone(), b.clone()]), t0 + Duration::from_secs(60));
+        let b_row = app.rows.iter().position(|r| r.id == "b").unwrap();
+        assert!(app.is_new(&app.rows[b_row]));
+        assert_eq!(app.card_roots(), vec![b_row]);
+        app.update_at(with(vec![stopped, b]), t0 + Duration::from_secs(60) + NEW_FOR);
+        assert!(!app.is_new(&app.rows[b_row]));
+    }
+
+    #[test]
+    fn card_keys_move_between_cards_and_enter_opens_the_table() {
+        let agents = vec![session("one", None, 3), session("kid", Some("one"), 1), session("two", None, 2)];
+        let mut app = session_app(agents).with_cards();
+        let ids = |app: &App| app.card_roots().into_iter().map(|i| app.rows[i].id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app), vec!["one", "two"], "a child rides in its parent's card");
+        app.select(0);
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.rows[app.selected].id, "two", "j skips the child row");
+        app.on_key(KeyCode::Char('k'));
+        assert_eq!(app.rows[app.selected].id, "one");
+        assert!(!app.on_key(KeyCode::Enter));
+        assert_eq!((app.view, app.show_detail), (View::Table, true));
+        assert!(!app.on_key(KeyCode::Esc), "Esc in the table goes back to the cards");
+        assert_eq!(app.view, View::Cards);
+        assert!(app.on_key(KeyCode::Esc), "and from the cards it quits");
+    }
+
+    #[test]
+    fn catch_up_reads_and_new_rows_do_not_count_as_output() {
+        let t0 = Instant::now();
+        let mut app = App::new(snapshot(0));
+        let mut s = snapshot(5_000_000);
+        s.catching_up = true;
+        app.update_at(s, t0);
+        let mut s = snapshot(5_000_100);
+        s.agents.push(session("newcomer", None, 9_000_000));
+        app.update_at(s, t0 + Duration::from_secs(10));
+        assert_eq!(app.output_rate.last(), Some(&10), "100 tokens of work over 10s; the backlog and the newcomer's history add nothing");
+    }
+
+    #[test]
+    fn quiet_agents_hide_unless_a_subagent_is_busy() {
+        let idle_for = |id: &str, parent: Option<&str>, secs: u64| {
+            let mut a = session(id, parent, 0);
+            a.state = AgentState::Idle;
+            a.idle_secs = Some(secs);
+            a
+        };
+        let agents = vec![
+            idle_for("quiet", None, 16 * 60),
+            idle_for("parent", None, 20 * 60),
+            session("busy-kid", Some("parent"), 0),
+            idle_for("fresh", None, 60),
+        ];
+        let mut app = session_app(agents).with_cards();
+        let mut ids: Vec<String> = app.card_roots().into_iter().map(|i| app.rows[i].id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["fresh", "parent"], "a quiet parent stays while its subagent works");
+        assert_eq!(app.hidden_cards(), 1);
+        app.on_key(KeyCode::Char('x'));
+        assert_eq!((app.card_roots().len(), app.hidden_cards()), (3, 0), "x shows the quiet ones too");
     }
 }
